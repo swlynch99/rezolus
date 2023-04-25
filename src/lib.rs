@@ -1,0 +1,135 @@
+use linkme::distributed_slice;
+use metriken::Lazy;
+use ringlog::*;
+
+type Duration = clocksource::Duration<clocksource::Nanoseconds<u64>>;
+type Instant = clocksource::Instant<clocksource::Nanoseconds<u64>>;
+
+pub mod common;
+pub mod config;
+pub mod exposition;
+pub mod samplers;
+
+use config::Config;
+
+pub static PERCENTILES: &[(&str, f64)] = &[
+    ("p25", 25.0),
+    ("p50", 50.0),
+    ("p75", 75.0),
+    ("p90", 90.0),
+    ("p99", 99.0),
+    ("p999", 99.9),
+    ("p9999", 99.99),
+];
+
+#[distributed_slice]
+pub static SAMPLERS: [fn(config: &Config) -> Box<dyn Sampler>] = [..];
+
+// #[distributed_slice]
+// pub static BPF_SAMPLERS: [fn(config: &Config) -> Box<dyn Sampler>] = [..];
+
+counter!(RUNTIME_SAMPLE_LOOP, "runtime/sample/loop");
+
+pub fn run(config: Config) {
+    // configure debug log
+    let debug_output: Box<dyn Output> = Box::new(Stderr::new());
+    // let debug_output: Box<dyn Output> = if let Some(file) = config.debug().log_file() {
+    //     let backup = config
+    //         .debug()
+    //         .log_backup()
+    //         .unwrap_or(format!("{}.old", file));
+    //     Box::new(
+    //         File::new(&file, &backup, config.debug().log_max_size())
+    //             .expect("failed to open debug log file"),
+    //     )
+    // } else {
+    //     // by default, log to stderr
+    //     Box::new(Stderr::new())
+    // };
+
+    let level = Level::Info;
+
+    let debug_log = if level <= Level::Info {
+        LogBuilder::new().format(ringlog::default_format)
+    } else {
+        LogBuilder::new()
+    }
+    .output(debug_output)
+    // .log_queue_depth(config.debug().log_queue_depth())
+    // .single_message_size(config.debug().log_single_message_size())
+    .build()
+    .expect("failed to initialize debug log");
+
+    let mut log = MultiLogBuilder::new()
+        .level_filter(level.to_level_filter())
+        .default(debug_log)
+        .build()
+        .start();
+
+    // initialize async runtime
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(1)
+        .build()
+        .expect("failed to launch async runtime");
+
+    // spawn logging thread
+    rt.spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let _ = log.flush();
+        }
+    });
+
+    info!("rezolus");
+
+    // spawn http exposition thread
+    rt.spawn(exposition::http());
+
+    // initialize and gather the samplers
+    let mut samplers: Vec<Box<dyn Sampler>> = Vec::new();
+
+    for sampler in SAMPLERS {
+        samplers.push(sampler(&config));
+    }
+
+    // let mut bpf_samplers: Vec<Box<dyn Sampler>> = Vec::new();
+
+    // for sampler in BPF_SAMPLERS {
+    //     bpf_samplers.push(sampler(&config));
+    // }
+
+    info!("initialization complete");
+
+    // main loop
+    loop {
+        RUNTIME_SAMPLE_LOOP.increment();
+
+        // get current time
+        let start = Instant::now();
+
+        // sample each sampler
+        for sampler in &mut samplers {
+            sampler.sample();
+        }
+
+        // calculate how long we took during this iteration
+        let stop = Instant::now();
+        let elapsed = (stop - start).as_nanos();
+
+        // calculate how long to sleep and sleep before next iteration
+        // this wakeup period allows a maximum of 1kHz sampling
+        let sleep = 1_000_000_u64.saturating_sub(elapsed);
+        std::thread::sleep(std::time::Duration::from_nanos(sleep));
+    }
+}
+
+pub trait Sampler {
+    // #[allow(clippy::result_unit_err)]
+    // fn configure(&self, config: &Config) -> Result<(), ()>;
+
+    /// Do some sampling and updating of stats
+    fn sample(&mut self);
+
+    // fn name(&self) -> &str;
+}
